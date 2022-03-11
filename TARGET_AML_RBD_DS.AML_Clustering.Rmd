@@ -1,0 +1,278 @@
+---
+title: ""
+author: "Jenny Smith"
+date: ""
+output: html_document
+---
+
+# Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, 
+                      fig.align='center', fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2018.08.06_DS.AML_DEGs","1031"))
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(purrr)
+library(DeGSEA)
+library(edgeR)
+library(matrixStats)
+library(gridExtra)
+getwd()
+```
+
+
+#Raw Counts
+
+```{r}
+AML.NBM.only <- TRUE
+```
+
+```{r}
+rbd.cts <- read_csv(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_0531_1031_Ribodepleted_RNAseq_dupGenesRemoved_FractionalCounts.csv"))
+
+if(AML.NBM.only){
+  #remove cell lines, MPN, flow sorted and replicate samples
+  rbd.cts <- rbd.cts[,-grep("Kas|MV4|MPN[0-9]|Sort|replicate", 
+                            colnames(rbd.cts), ignore.case = TRUE)]
+  #Set-rownames
+  rbd.cts <- column_to_rownames(rbd.cts, "X1")
+  
+  #change to only USI for colnames
+  colnames(rbd.cts) <- str_split_fixed(colnames(rbd.cts),  "\\.", 5)[,3]
+
+}
+  
+dim(rbd.cts) #51573  1460
+head(rbd.cts[,1:5])
+```
+
+```{r}
+ds.cts <- read_csv(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AAML08B1_AAML1531_Ribodepleted_RNAseq_DS-AML_dupGenesRemoved_FractionalCounts.csv"))
+
+#Set-rownames
+ds.cts <- column_to_rownames(ds.cts, "X1")
+ds.cts <- ds.cts[,-grep("PAXDWD.03A.01R", colnames(ds.cts))] #sample has BM and peripheral blood dx timepoint sample
+ds.cts <- ds.cts[,!grepl("04A|40A", colnames(ds.cts))] #remove relapse samples for now
+colnames(ds.cts) <- str_split_fixed(colnames(ds.cts),  "\\.", 3)[,1]
+# 
+head(ds.cts[,1:5])
+dim(ds.cts) #51573   219
+```
+
+
+#ClinData
+
+```{r}
+DS.AML <- read.csv("DS_AML_TMD_cohorts_RNA_seq.csv") %>% 
+  select(USI,Protocol=Study, everything()) %>% 
+  filter(Timepoint!="Relapse") %>% # no relapses for now
+  filter(Sample.ID != "PAXDWD-03A-01R") %>% 
+  mutate(specimen=ifelse(grepl("03A", Sample.ID), "PB","BM"))
+  
+head(DS.AML)
+dim(DS.AML) # 219   5
+
+table(DS.AML$specimin)
+```
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.4.19.csv"))
+
+head(merged[,1:5])
+```
+
+
+```{r}
+clinData <- merged %>% 
+  select(USI,Protocol,Cytogenetic.Category.1, Cytogenetic.Category.2, Rare.Fusions, SNVs) %>%
+  filter(USI %in% colnames(rbd.cts)) %>%
+  add_row(USI=grep("^BM|^RO", colnames(rbd.cts), value = TRUE)) %>%
+  bind_rows(DS.AML) %>%
+  filter(!duplicated(USI)) %>% #one duplicate USI. 
+  mutate_at(vars(Status), ~case_when(
+    grepl("^BM|^RO", USI) ~ "NBM",
+    is.na(.) ~"AML",
+    TRUE ~ .))  %>%
+  mutate_at(vars(Protocol:SNVs), ~case_when(
+    is.na(.) ~ Status,
+    TRUE ~ .)) %>%
+  set_rownames(.$USI)
+
+head(clinData)
+dim(clinData) # 1591    9
+```
+
+```{r}
+sum(is.na(clinData$USI))
+map(select(clinData, Protocol:Status,-Sample.ID), table, useNA='ifany')
+```
+
+```{r}
+combined <- inner_join(rownames_to_column(rbd.cts[,colnames(rbd.cts) %in% clinData$USI], "Gene"),
+                       rownames_to_column(ds.cts[,colnames(ds.cts) %in% clinData$USI],"Gene"), 
+                      by="Gene") %>% 
+  column_to_rownames("Gene")
+
+head(combined[,1:5])
+dim(combined) #51573  1591
+```
+
+
+## TMM Normalization
+
+```{r}
+dge <- DGEList(counts = combined)
+
+keep.dge <- rowSums(cpm(dge) >= 1) >= ncol(combined)*0.05 
+table(keep.dge)
+
+dge <- dge[keep.dge,] #subset for those genes with cmp >= 1 per gene in AML samples
+dge <- calcNormFactors(dge) #Do TMM normalization
+```
+
+```{r}
+TMMCPM <- cpm(dge, normalized.lib.sizes=TRUE)
+head(TMMCPM[,1:5])
+dim(TMMCPM) 
+
+log2.TMM <- log2(TMMCPM+1)
+head(log2.TMM[,1:5])
+```
+
+```{r}
+# calculate the variance for each gene
+rv <- rowVars(log2.TMM)
+# select the ntop genes by variance
+select <- order(rv, decreasing=TRUE)[seq_len(min(500, length(rv)))]
+```
+
+```{r}
+head(rownames(log2.TMM)[select], n=20)
+```
+
+
+#Unsupervised Clustering
+
+##Heatmap
+
+```{r}
+cols <- c("Cytogenetic.Category.1","SNVs", "Rare.Fusions", "Status")
+cc <- colorCodes_aheatmap(df=clinData[,cols])
+
+cc <- lapply(cc, function(x){x["TMD"] <- "#440154FF"; x["DS"] <- "#21908CFF";x["AML"] <- "lightgrey"; return(x)})
+
+# cc
+```
+
+```{r}
+anno <- create_HA_Labs_Hmap(expn = log2.TMM, 
+                            geneList = select,
+                            cc=cc, 
+                            CDE=clinData,
+                            cols=cols)
+```
+
+
+```{r}
+hmap <- ComplexHmap(mat=log2.TMM[select,],
+                    hmap_anno_obj = anno$annoColumn)
+```
+
+```{r fig.width=14}
+# tiff("TARGET_AML_DS-AML_Top500_MostVariedGenes_Heatmap.tiff", height = 10, width = 16, units="in", res=350)
+draw(hmap)
+# dev.off()
+```
+
+
+```{r}
+# calculate the variance for each gene
+rv.ds <- rowVars(log2.TMM[,DS.AML$USI])
+
+# select the ntop genes by variance
+select.ds <- order(rv, decreasing=TRUE)[seq_len(min(500, length(rv)))]
+```
+
+```{r}
+anno.ds <- create_HA_Labs_Hmap(expn = log2.TMM[,DS.AML$USI], 
+                            geneList = select.ds,
+                            cc=cc[4], 
+                            CDE=clinData,
+                            cols=cols[4])
+```
+
+```{r}
+hmap.ds <- ComplexHmap(mat=log2.TMM[select.ds,DS.AML$USI],
+                    hmap_anno_obj = anno.ds$annoColumn, colorbar.height = 1.5)
+
+# tiff("DS-AML_Top500_MostVariedGenes_Heatmap.tiff", height = 10, width = 10, units="in", res=350)
+draw(hmap.ds)
+# dev.off()
+```
+
+
+## PCA 
+
+list(fill=cc[[4]][c("TMD","DS")], color=c("BM"="grey10","PB"="grey60")) 
+                                      
+                                      
+```{r}
+pca.ds <- pca_custom(expnData = log2.TMM[select.ds, DS.AML$USI], 
+                     CDE=clinData[DS.AML$USI,], fillCol = "Status", 
+                     colorCol = "specimen", 
+                     PC3=TRUE,ellipse = TRUE,
+                     colorCode = cc[[4]][c("TMD","DS")])
+
+```
+
+
+```{r fig.height=5, fig.width=12}
+pca.A <- grid.arrange(grobs=list(pca.ds$plot.1, pca.ds$plot.2), ncol=2)
+
+saveRDS(pca.A, "DS-AML_DSvsTMD_withSpeciminType_pca.RDS")
+```
+
+
+```{r}
+pca.ds2 <- pca_custom(expnData = log2.TMM[select.ds, DS.AML$USI], 
+                     CDE=clinData[DS.AML$USI,], fillCol = "Status", 
+                     colorCol = NULL, 
+                     PC3=TRUE,ellipse = TRUE,
+                     colorCode = cc[[4]][c("TMD","DS")])
+
+```
+
+
+```{r fig.height=5, fig.width=12}
+pca.B <- grid.arrange(grobs=list(pca.ds2$plot.1, pca.ds2$plot.2), ncol=2)
+
+# saveRDS(pca.B,"DS-AML_DSvsTMD_pca.RDS")
+# ggsave(filename = "DS-AML_DSvsTMD_pca.tiff", plot=pca.B, height = 5, width = 12, units="in", dpi=350, device = "tiff")
+```
+
+
+#Perform Differential Expression
+
+
+
+#QC Plots 
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

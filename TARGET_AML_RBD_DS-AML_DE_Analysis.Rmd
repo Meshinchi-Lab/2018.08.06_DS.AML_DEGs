@@ -1,0 +1,811 @@
+---
+title: "DE Analysis with RBD DS-AML vs TMD"
+author: "Jenny Smith"
+date: "7/10/20"
+output: html_document
+---
+
+#Set-up
+
+```{r setup}
+library(knitr)
+
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2018.08.06_DS.AML_DEGs/RBD_08B1_1531"))
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, 
+                      fig.align='center', fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(Cairo)
+library(gridExtra)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(DeGSEA)
+
+
+library(gtools)
+
+
+getwd()
+```
+
+
+#Define Functions
+
+```{r}
+#remove unknown categories from the datasets since only want yes/no or 0/1 groups
+rmUnknowns <- function(clinData, cols){
+    removeUnknowns <- clinData
+    
+    for (i in 1:length(cols)){
+      idx <- ! grepl("Unknown",removeUnknowns[, cols[i]], ignore.case=TRUE)
+      removeUnknowns <- removeUnknowns[idx, ] 
+    }
+    return(removeUnknowns)
+}
+```
+
+
+```{r}
+voom_DE_BE <- function(expnData,clinData,col,percent=0.05, 
+                       trend=FALSE, logCPM=FALSE,
+                       normalization=FALSE,
+                       GOI=NULL){
+  library(edgeR)
+  library(limma)
+  
+  ##ensure correct order
+  expnData <- expnData[,match(rownames(clinData), colnames(expnData))] 
+  
+  if (!all(complete.cases(expnData))){
+    print("Names DO NOT match in between phenovector and colnames of expression matrix")
+    return(list(expnData=expnData,pheno=clinData))
+  }
+  
+  #NOTE ClinData MUST BE already factor  leveled! 
+  dge <- DGEList(counts = expnData, samples = clinData[,col])
+  
+  
+    #remove low count genes. This is to allow for 2/3 samples must have 1 cpm. Since 3 is the minimum # of samples I will allow for DE analysis. 
+  AML <- ! grepl("BM[0-9]|R[O0][0-9]", colnames(expnData))
+  AMLsamples <- sum(AML)
+  #X% of AML samples has cpm of at least 1 for a gene
+  keep.dge <- rowSums(cpm(dge)[,AML] >= 1) >= max(2,(percent*AMLsamples)) 
+  dge <- dge[keep.dge,] #subset for those genes with cmp >= 1 per gene in AML samples
+  dge <- calcNormFactors(dge) #Do TMM normalization
+  
+  
+  #Create a design and contrasts with  the groups to compare and the co-variate/batch effect variable 
+  #since the columns in dge$samples dataframe are already factor leveled - the ref is in the first column in the design
+  design <- model.matrix(formula(paste(c("~0", col), collapse="+")),  
+                         data=dge$samples) #~0 means no intercept. 
+  colnames(design) <- c("Ref","Comparitor","BatchEffect") 
+  
+  #contrast is the comparison-referenceGroup, or Pos-Neg, or Mut-WT 
+  cont.matrix <- makeContrasts(contrasts = paste(c("Comparitor","Ref"),collapse = "-"), 
+                               levels = design)
+  
+  
+  if (is.null(GOI)){ 
+    GOI <- 1:nrow(dge)
+  }else{
+    GOI <- intersect(rownames(dge), GOI)
+    print(paste0("Length of GOI: ", length(GOI)))
+  }
+  
+  
+  if (logCPM){
+    dge.norm <- cpm(dge, log=TRUE, prior.count = 1) #log2 + 1 CPM transformatio for normalization for sample to sample comparisons. 
+    NormFactors <- "TMMCPM"
+    
+  }else if (all(!logCPM & !normalization)){
+    dge.norm <- voom(dge, design, plot = TRUE) #can I use voom transformed values like CPM? yes
+    NormFactors <- "Voom"  #voom transformed counts for sample to sample comparisons.
+  
+  }else if(all(!logCPM & normalization=="qt")){
+    dge.norm <- voom(dge, design, plot = FALSE, normalize.method = "quantile")
+    NormFactors <- "Voom.quantile" #voom and quantilte normalized counts for sample to sample comparisons.
+  }
+
+  print(NormFactors) #to confirm which type of DE is performed, trend or voom
+  
+  #fit the linear model. 
+  fit <- lmFit(dge.norm, design)
+  fit <- contrasts.fit(fit, contrasts = cont.matrix)
+  
+  #compute moderated t-statistics using empirical bayes moderation. 
+  if(all(trend & logCPM)){ #only use limma trend method with CPM values, as per manual. 
+    fit2 <- eBayes(fit,trend = trend)[GOI,]
+  }else{
+    fit2 <- eBayes(fit)[GOI,]  
+  }
+
+  # select differentially expressed genes.
+  DE <-topTable(fit2,adjust.method="BH",sort.by="P",
+                 number=20000,p.value=0.05, lfc=1) #abs(logFC) >= 1 for all genes
+
+  list <- list(dge.norm,fit2, cont.matrix, DE)
+  names(list) <- c(NormFactors,"eBayesFit","contrasts", "DE")
+  
+
+  return(list)
+}
+```
+
+
+
+#Raw Counts
+
+```{r}
+rbd.cts <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/TARGET_AML_MPN_DS_NBM_2646Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS"))
+
+dim(rbd.cts) #51573  2646
+head(rbd.cts[,1:5])
+```
+
+```{r }
+TPM <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/TARGET_AML_MPN_DS_NBM_2646Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_TPM.RDS"))
+  
+dim(TPM) #51573 
+head(TPM[,1:5])
+```
+
+
+#ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.18.20.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI), USI != "Unknown") %>% 
+  filter(!Reg. %in% c(773920,775026, 786948,799528)) %>% 
+  filter(Eligibility_Comments != "remove")
+
+
+dim(merged)
+```
+
+```{r}
+manifest_all <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_10.08.20.csv"))  %>% 
+  left_join(., select(merged,-Group,-Protocol,-Primary.Fusion,-Primary.CNV,  -Additional.Fusions.CNV),
+            by="USI") %>% 
+  mutate_at(vars(Age.Category,
+                 Primary.CNV,M7_AML,
+                 Cytogenetic.Category.1,
+                 Cytogenetic.Category.2,
+                 SNVs,Rare.Fusions), 
+            ~ifelse(is.na(.), Group, .)) #age.category has 81 unknowns?? seems off. 
+
+head(manifest_all)
+dim(manifest_all) #2646   15
+# table(manifest_all$Group, manifest$Tissue) 
+```
+
+
+#Perform Differential Expression
+
+```{r}
+library(ComplexHeatmap)
+```
+
+```{r}
+geneIDmap <- read.csv(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/GeneSymbol_Ensembl_ID_Conversion_GRCh37.69_FromBCCA.csv"))
+dim(geneIDmap)
+head(geneIDmap)
+```
+
+```{r}
+chr21_genes <- read.csv("RBD_08B1_1531/Chromosome_21_Genes.csv") %>% 
+  inner_join(., geneIDmap, by=c("Gene.stable.ID"="gene_id"))
+
+head(chr21_genes)
+# dim(chr21_genes) #736 (692 by ENSG merge)
+```
+
+```{r}
+filter(chr21_genes, grepl("CBR1|CBR3", Gene.name)) #Genes of interest! Implicated in chemo-resistance to danarubicin
+# filter(chr21_genes, Gene.name != geneSymbol) 
+```
+
+
+# Chromosome 21 Genes Summary Stats
+
+```{r}
+input_samples <- manifest_all %>% 
+  filter(grepl("DS|TMD|AML|NBM", Group), 
+         grepl("DS|TMD|Yes|NBM", M7_AML),
+         grepl("NBM|diagnostic", Time_point)) %>% 
+  filter(!grepl("replicate", Sample)) %>% 
+  mutate_at(vars(Group), ~gsub("AML", "AMKL", .))
+  
+# table(input_samples$AML_Subtype)
+# table(input_samples$M7_AML)
+table(input_samples$Group)
+
+# head(input_samples)
+```
+
+```{r}
+long_format_TPM <- TPM[,c("Gene", input_samples$Sample)] %>% #using genes with low counts removed
+  
+  #only Chr21 genes
+  dplyr::filter(Gene %in% chr21_genes$geneSymbol) %>% 
+  
+  #make into long format
+  gather(Sample,TPM,-Gene) %>% 
+  
+  #Add in the blast percentage and other information
+  left_join(.,select(input_samples,
+                     Sample,Group,
+                     USI,ETS_Fusion,
+                     AML_Subtype,
+                     Primary.Fusion,
+                     Additional.Fusions.CNV,
+                     Primary.CNV,
+            BM.Blast.Percent=Bone.marrow.leukemic.blast.percentage....),
+            by="Sample") %>%
+  dplyr::select(Sample,USI,BM.Blast.Percent,
+                Primary.Fusion,
+                Additional.Fusions.CNV,
+                Primary.CNV,ETS_Fusion,
+                everything()) %>%
+  #For fusion groups with multiple partners
+  mutate(KMT2A=case_when(
+          grepl("KMT2A",Primary.Fusion) | grepl("KMT2A", Additional.Fusions.CNV) ~ "KMT2A", 
+          TRUE ~ "OtherAML"), 
+    ETS_Fusion_Group=case_when(
+           ETS_Fusion != "No" | ETS_Fusion != "Unknown" ~ "ETS_Fusion",
+           TRUE ~ "OtherAML"),
+    NUP98=case_when(
+        grepl("NUP98",Primary.Fusion) | grepl("NUP98", Additional.Fusions.CNV) ~ "NUP98", 
+        TRUE ~ "OtherAML")) %>%
+  arrange(Gene)
+
+head(long_format_TPM)
+dim(long_format_TPM)
+```
+
+```{r}
+aml_cutoff <- 5.0
+
+
+chr21Genes.stats <-  long_format_TPM %>%
+  
+  #Add in columns for the whole AML cohort
+  group_by(Gene,Group) %>%
+  summarize(Total_Number_Samples=n(),
+
+            !!paste0("Number.Expressors_GT.", aml_cutoff,"TPM") := sum(TPM >= aml_cutoff),
+            !!paste0("Percent.Expressors_GT.", aml_cutoff,"TPM") := sum(TPM >= aml_cutoff)/n()*100,
+
+            min.TPM=min(TPM),
+            Mean.TPM=mean(TPM),
+            Median.TPM=median(TPM),
+            Max.TPM=max(TPM)) %>%
+  ungroup() %>% 
+  # rename_at(vars(Total_Number_Samples:CD33_Corr), ~paste0(.,"_AML")) %>% 
+  mutate_if(is.numeric, ~round(., digits = 2)) 
+  
+  
+# chr21Genes.stats  
+
+chr21Genes.stats <- gather(chr21Genes.stats, Stats, Value, Total_Number_Samples:Max.TPM) %>% 
+  unite("Stats_per_Group",Stats,Group,sep = "_") %>% 
+  spread(Stats_per_Group,Value) %>% 
+  select(Gene, matches("Percent.Expressors_GT.5TPM"), matches("_DS"),matches("_NBM"), matches("_AMKL")) %>% 
+  filter(Percent.Expressors_GT.5TPM_DS >= 5.0) %>% 
+  arrange(desc(Median.TPM_DS)) 
+
+chr21Genes.stats
+quantile(chr21Genes.stats$Percent.Expressors_GT.5TPM_DS)
+# chr21Genes.stats %>% 
+#   filter(grepl("CBR", Gene))
+
+# write.csv(chr21Genes.stats,"TARGET_DS.AML_vs_AMKL_chr21_Genes_Summary_Stats.csv", row.names = F)
+```
+
+
+#DS vs NBM 
+
+```{r}
+samps_DS_vs_NBM <- manifest_all %>% 
+  filter(grepl("NBM|DS", Group), Time_point != "relapse") %>% 
+  filter(!grepl("replicate", Sample)) %>% 
+  mutate(USI.x=USI,
+         USI=Sample) %>% 
+  select(Sample,USI,USI.x, everything()) %>%  #OK this is very hacky..
+  set_rownames(.$Sample)
+
+
+# head(samps_DS_vs_NBM)
+table(samps_DS_vs_NBM$Group)
+table(samps_DS_vs_NBM$Time_point)
+```
+
+```{r}
+# cols.colorbar <- c("Age.Category","Cytogenetic.Category.1","Cytogenetic.Category.2", "SNVs","Rare.Fusions","Group") 
+cols.NBM <- c("Tissue","Group")
+# lapply(samps_DS_vs_NBM[,cols.colorbar], function(x) table(x,useNA = "ifany"))
+```
+
+```{r}
+DSvsNBM <- twoGroups_DEGs(expnData = column_to_rownames(rbd.cts,"Gene")[,samps_DS_vs_NBM$Sample], 
+                          clinData = samps_DS_vs_NBM, 
+                          col = "Group",ref = "NBM",
+                          Custom.Cols = cols.colorbar,
+                          anno = FALSE)
+
+# saveRDS(DSvsNBM,"TARGET_DS.AML_vs_NBM_DEGs.RDS")
+```
+
+```{r}
+table(DSvsNBM$phenovector)
+```
+
+```{r}
+DSvsNBM_DEGs <- extract_DEGs(DSvsNBM)
+
+head(DSvsNBM_DEGs)
+tail(DSvsNBM_DEGs)
+
+dim(DSvsNBM_DEGs) #5963    8
+
+table(DSvsNBM_DEGs$logFC > 1.0)
+# write.csv(DSvsNBM_DEGs, "TARGET_AML_DS.AML_vs_NBM_DEGs_11.09.20.csv", row.names = F)
+```
+
+```{r fig.height=5, fig.width=7}
+extract_MDS(DSvsNBM)
+extract_PCA(DSvsNBM)
+```
+
+```{r}
+# pdf("TARGET_DS.AML_vs_NBM_DEGs_Heatmap.pdf", height = 10, width=12)
+DSvsNBM$Heatmap
+# dev.off()
+```
+
+```{r}
+DSvsNBM_chr21 <- twoGroups_DEGs(expnData = column_to_rownames(rbd.cts,"Gene")[,samps_DS_vs_NBM$Sample], 
+                          clinData = samps_DS_vs_NBM, 
+                          col = "Group",ref = "NBM",
+                          Custom.Cols = cols.NBM,
+                          GOI = unique(chr21_genes$geneSymbol), #"Length of GOI: 222"
+                          anno = FALSE)
+
+# saveRDS(DSvsNBM_chr21,"TARGET_DS.AML_vs_NBM_DEGs_chr21.RDS")
+```
+
+```{r}
+DSvsNBM_chr21_DEGs <- extract_DEGs(DSvsNBM_chr21)
+
+head(DSvsNBM_chr21_DEGs)
+tail(DSvsNBM_chr21_DEGs)
+dim(DSvsNBM_chr21_DEGs) #89  8
+
+table(DSvsNBM_chr21_DEGs$logFC >1)
+# write.csv(DSvsNBM_chr21_DEGs, "TARGET_DS.AML_vs_NBM_DEGs_Chr21.csv", row.names = FALSE)
+```
+
+```{r}
+DSvsNBM_chr21_DEGs %>% 
+  filter(grepl("CBR", gene))
+```
+
+
+
+#DS vs AMKL
+
+```{r}
+samps_DS_vs_AMKL <- manifest_all %>% 
+  filter(grepl("DS|AML", Group), Time_point != "relapse", Time_point != "remission") %>% 
+  filter(!grepl("replicate", Sample)) %>% 
+  filter(M7_AML == "Yes" | Group == "DS") %>% 
+  
+  mutate(USI.x=USI,USI=Sample) %>% 
+  select(Sample,USI,USI.x, everything()) %>%  #OK this is very hacky..
+  set_rownames(.$Sample)
+
+# 
+# samps_DS_vs_AMKL
+table(samps_DS_vs_AMKL$Group)
+# table(samps_DS_vs_AMKL$Time_point)
+# table(samps_DS_vs_AMKL$Tissue)
+```
+
+```{r}
+samps_DS_vs_AMKL %>% 
+  group_by(AML_Subtype) %>% 
+  summarize(N=n()) %>% 
+  ungroup() %>% 
+  arrange(desc(N)) #%>% 
+  # write.csv(., "DS.AML_vs_AMKL_Subtype_Table.csv", row.names = F)
+
+samps_DS_vs_AMKL %>% 
+  group_by(Primary.CNV) %>% 
+  summarize(N=n()) %>% 
+  ungroup() %>% 
+  arrange(desc(N)) #%>% 
+  # write.csv(., "DS.AML_vs_AMKL_CNV_Table.csv", row.names = F)
+```
+
+```{r}
+# cols.colorbar <- c("Age.Category","Cytogenetic.Category.1","Cytogenetic.Category.2", "SNVs","Rare.Fusions","Group") 
+cols.AMKL <- c("Age.Category","Tissue","AML_Subtype","Primary.CNV","Group")
+```
+
+```{r}
+DSvsAMKL <- twoGroups_DEGs(expnData = column_to_rownames(rbd.cts,"Gene")[,samps_DS_vs_AMKL$Sample], 
+                          clinData = samps_DS_vs_AMKL, 
+                          col = "Group",
+                          ref = "AML",
+                          Custom.Cols = cols.AMKL,
+                          anno = FALSE)
+
+# saveRDS(DSvsAMKL,"TARGET_DS.AML_vs_AMKL_DEGs.RDS")
+```
+
+```{r}
+table(DSvsAMKL$phenovector)
+```
+
+converting counts to integer mode
+some variables in design formula are characters, converting to factors
+
+
+```{r}
+DSvsAMKL_DEGs <- extract_DEGs(DSvsAMKL)
+
+head(DSvsAMKL_DEGs)
+tail(DSvsAMKL_DEGs)
+dim(DSvsAMKL_DEGs) #2559    8
+
+table(DSvsAMKL_DEGs$logFC>1)
+# write.csv(DSvsAMKL_DEGs,"TARGET_DS.AML_vs_AMKL_DEGs_11.09.20.csv", row.names = F)
+```
+
+```{r fig.height=5, fig.width=7}
+extract_MDS(DSvsAMKL)
+extract_PCA(DSvsAMKL)
+```
+
+
+```{r fig.height=10, fig.width=12}
+# pdf("TARGET_DS.AML_vs_AMKL_DEGs_Heatmap.pdf", height = 10, width = 14)
+DSvsAMKL$Heatmap
+# dev.off()
+```
+
+
+```{r}
+DSvsAMKL_chr21 <- twoGroups_DEGs(expnData = column_to_rownames(rbd.cts,"Gene")[,samps_DS_vs_AMKL$Sample], 
+                          clinData = samps_DS_vs_AMKL, 
+                          col = "Group",
+                          ref = "AML",
+                          Custom.Cols = cols.AMKL,
+                          GOI = chr21_genes$geneSymbol,
+                          anno = FALSE)
+
+# saveRDS(DSvsAMKL_chr21,"TARGET_DS.AML_vs_AMKL_DEGs_chr21.RDS")
+```
+
+```{r}
+DSvsAMKL_DEGs_chr21 <- extract_DEGs(DSvsAMKL_chr21)
+
+head(DSvsAMKL_DEGs_chr21)
+tail(DSvsAMKL_DEGs_chr21)
+dim(DSvsAMKL_DEGs_chr21) #
+
+table(DSvsAMKL_DEGs_chr21$logFC>1)
+# write.csv(DSvsAMKL_DEGs_chr21,"TARGET_DS.AML_vs_AMKL_DEGs_chr21_11.09.20.csv", row.names = F)
+```
+
+```{r}
+DSvsAMKL_DEGs_chr21 %>% 
+  filter(grepl("CBR", gene))
+```
+
+
+# DS vs TMD 
+
+```{r}
+manifest <- manifest %>% 
+  filter(Batch == "ds1", Time_point=="diagnostic") %>% 
+  dplyr::select_if(~!all(is.na(.))) %>%
+  dplyr::select(Sample, USI,everything()) %>% 
+  set_rownames(.$Sample)
+
+head(manifest)
+dim(manifest)
+```
+
+```{r}
+expnData = rbd.cts[,manifest$Sample]
+clinData = manifest %>%
+  dplyr::select(USI=Sample,DS_AML=Group,
+         Subtype=AML_Subtype,
+         everything(), -USI)
+
+
+col = c("DS_AML","Tissue")
+ref = c("TMD","peripheral_blood")
+
+percent.cutoff=0.05
+logCPM=FALSE
+BM=FALSE
+GOI=NULL
+anno=TRUE
+ids2symbols=NULL
+gene.name.col="gene"
+method="ward.D2" 
+Add.Anno.Col=FALSE
+Custom.Cols=TRUE
+Anno.Cols=c("Subtype","Tissue")
+SkipPlots=FALSE
+
+#For file names
+variantName <- paste0(col, collapse="+")
+  
+#Remove unknowns from clindata
+print(variantName)
+clinData <- rmUnknowns(clinData, col)
+
+#Define Groups to compare based on group IDs from clinical data. Intersect with expression matrix to subset. 
+if (BM == TRUE){
+    BM <- grep("BM[0-9|R[O0][0-9]", colnames(expnData), value = TRUE)
+    GroupB <- BM #select NBM as reference group 
+
+    clinData <- clinData %>% 
+      add_row(USI=GroupB) %>% 
+      #fill in the NA values when you added the rows of NBM samples which will be the comparison group (eg Wild-type)
+      mutate_at(vars(all_of(col)), ~ifelse(is.na(.), "NBM", .)) %>%
+      set_rownames(.$USI)
+    
+    ref <- "NBM"
+    
+}
+
+#after removing Removing unknowns, subset the dataframe.
+expnData <- expnData[ ,intersect(colnames(expnData),rownames(clinData))] 
+clinData <- clinData[intersect(colnames(expnData),rownames(clinData)), ]
+  
+print(dim(expnData))
+print(dim(clinData))
+
+# Check that No NAs introduced with the match)() function.
+if (any(is.na(expnData))){print("NAs Introduced. Check Rownames and colnames of inputs")}
+
+#create the correct factor levels to the reference group
+for (i in 1:length(col)){
+  rn <- rownames(clinData)
+  
+  clinData <- clinData %>%
+              mutate_at(vars(all_of(col[i])), 
+                  ~as.factor(.) %>% relevel(., ref=ref[i])) %>% 
+    #droplevels in case there are three or more levels... not sure I'll keep this 
+    droplevels(.) %>% 
+    as.data.frame(.) %>% 
+    set_rownames(., value = rn)
+  rm(i)
+}
+
+# clinData[,col]
+# levels(clinData$DS_AML)
+# levels(clinData$Tissue)
+
+
+#Only analyze at least 3x3 comparisons at minimum
+LT3 <- sapply(col, function(x) any(table(clinData[[x]]) < 3))
+if (any(LT3)){
+    message(paste("The column",names(LT3)[which(LT3)], "has less than 3 samples in a group."))
+    list <- list(expnData, clinData, GroupA,GroupB)
+    names(list) <- c("InputExpnMatrix","InputClinData", "GroupA","GroupB")
+    # return(list)
+}
+
+
+#Something off about the tissue. I must be splitting strings or something...
+groups_to_compare <- GroupIDs(clinData = clinData, col=col[1])
+idx <- names(groups_to_compare) == ref[1]
+groupA <-  unlist(groups_to_compare[!idx])
+groupB <-  unlist(groups_to_compare[idx])
+
+phenoVector <- phenoVectors(groupA = groupA,
+                            groupB = groupB)
+
+head(phenoVector)
+
+```
+
+```{r}
+# Calculate Differential Expression
+DE <- voom_DE_BE(expnData = expnData, 
+                clinData = clinData, #must be factor levels already for cols of interest
+                col=col,
+                percent=percent.cutoff,
+                logCPM=logCPM, 
+                normalization=FALSE,
+                GOI=GOI)
+  
+#add column for linear scale fold-changes
+DE$DE$FoldChange <- logratio2foldchange(DE$DE$logFC) 
+  
+#Add Protein Annotations to the DEGs
+if(nrow(DE$DE) == 0){print("No DEGs identified")}
+  if(anno & nrow(DE$DE) > 0){
+    DE[["DE.Anno"]] <- gene_protein_anno(df=rownames_to_column(DE$DE, "gene"),
+                                         gene.name.col = gene.name.col,
+                                         ids2symbols = ids2symbols)
+}
+  
+#begin list of results
+res <- list("phenovector"=phenoVector, "DE"=DE)
+```
+
+
+```{r}
+#Save DEGs 
+DE.anno <- extract_DEGs(res, anno=TRUE, geneLevel = TRUE)
+
+head(DE.anno)
+dim(DE.anno) #1848   28
+# write.csv(DE.anno, "AAML08B1_1531_DS_vs_TMD_DEGs_annotated.csv")
+```
+
+```{r}
+sum(DE.anno$logFC > 1)
+sum(DE.anno$logFC < 1)
+
+pot.targs <- filter(DE.anno, logFC > 1, 
+       (!is.na(Antibody.Drug.Conjugate..ADC..symbol.or.trade.name) |
+       !is.na(Drug.Gene.Interaction.DB))) %>% 
+  arrange(desc(logFC), 
+          Antibody.Drug.Conjugate..ADC..symbol.or.trade.name) %>%
+  mutate(adj.P.Val=formatC(adj.P.Val, format="e", digits = 2),
+         FoldChange=round(FoldChange, digits = 3))%>% 
+  dplyr::select(gene,Antibody.Drug.Conjugate..ADC..symbol.or.trade.name,  Drug.Gene.Interaction.DB, 
+         adj.P.Val, FoldChange)
+
+# write.csv(pot.targs, "AAML08B1_1531_DS_vs_TMD_DEGs_Potential_Targets_annotated.csv")
+```
+
+```{r}
+table(phenoVector)
+```
+
+
+
+#QC Plots
+
+```{r}  
+#to avoid PCA/Heatmaps when not needed. 
+if(SkipPlots){
+    return(res)
+}
+  
+if (nrow(DE$DE) <= 9){
+    cc <- c("GroupB"="black", "GroupA"="firebrick")
+    eigen <- PCA(expnData, phenoVector,colorCode=cc, title=variantName)
+    
+    res[c("InputClinData", "InputExpnMatrix","PCA")] <-  list(clinData, expnData, eigen)
+    return(res)
+    
+}else{
+
+
+#Unsupervised Heirachrach clustering
+cols.colorbar <- c("Cytogenetic.Category.1","Cytogenetic.Category.2", "SNVs","Rare.Fusions", col) 
+
+if(Add.Anno.Col){
+      cols.colorbar <- c(cols.colorbar, Anno.Cols)
+      # print(c("Annotation Columns", cols.colorbar))
+
+}else if (Custom.Cols){
+      cols.colorbar <- c(Anno.Cols)
+}
+
+if(all(cols.colorbar %in% colnames(clinData))){
+      cc <- colorCodes_aheatmap(df=clinData[,cols.colorbar])
+      
+      
+      #Dendrogram (for easier pulling out "like" groups that cluster together and clustering is done on log2 valuies that are not scaled before hand)
+      dends_DE <- dge_dendrograms(expnData = expnData , #expnData can be counts or TMM normalized (but set createDGE=FALSE)
+                                  pheno = phenoVector,
+                                  genelist = rownames(DE$DE), #subset for only DEGs
+                                  createDGE=TRUE,
+                                  add.count=0.01,
+                                  method=method)
+      
+      #annotation color bars
+      HA <- create_HA_Labs_Hmap(expn=dends_DE$TMMCPM,
+                              geneList=rownames(DE$DE),
+                              CDE=clinData,
+                              cols=cols.colorbar,
+                              cc=cc)
+      #heatmap
+      heatmap <- ComplexHmap(mat=dends_DE$TMMCPM,
+                             hmap_anno_obj=HA$annoColumn,
+                             dge_dendrograms.res=dends_DE)
+
+    }else{
+      print("Default Column Names not in Clinical Data Frame - 
+            check Input CDEs or provide a vector of column names.")
+      # heatmap <- figure out how to skip teh annotation object in complex heatmap
+    }
+
+    #PCA Clustering
+    cc <- c("GroupB"="grey50", "GroupA"="firebrick")
+    eigen <- PCA(expnData, phenoVector, 
+                 colorCodes=cc,
+                 title=variantName, 
+                 GOI=GOI) # PCA on top 500 varied genes in dataset.
+      
+    #Unconstrained Cluster Analysis/ PCoA
+    genes <- rownames(DE$DE)
+    MDS <- plotPCoA(assay(eigen$vst),
+                    phenoVector,
+                    geneList=genes, 
+                    colorCode=cc, 
+                    title=variantName) 
+    
+    #return the objects
+    res[c( "dendrogram", "Heatmap", "MDS", "PCA")] <- list( dends_DE, heatmap, MDS, eigen)
+}
+```
+
+```{r}
+# dir.create("RBD_08B1_1531/Tissue_in_Model")
+# saveRDS(res,"RBD_08B1_1531/Tissue_in_Model/AAML08B1_1531_DS_vs_TMD_DEGs.RDS")
+```
+
+```{r}
+# pdf("AAML08B1_1531_DS_vs_TMD_DEGs_Heatmap.pdf",height = 10, width = 11)
+ComplexHeatmap::draw(res$Heatmap)
+# dev.off()
+```
+
+
+
+
+#Example Contrasts with Batch
+
+https://ucdavis-bioinformatics-training.github.io/2018-June-RNA-Seq-Workshop/thursday/DE.html
+
+group <- interaction(cultivar, time)
+group
+ [1] C.6  C.6  C.6  C.6  C.9  C.9  C.9  C.9  I5.6 I5.6 I5.6 I5.6 I5.9 I5.9
+[15] I5.9 I5.9 I8.6 I8.6 I8.6 I8.6 I8.9 I8.9 I8.9 I8.9
+Levels: C.6 I5.6 I8.6 C.9 I5.9 I8.9
+
+batch <- factor(rep(rep(1:2, each = 2), 6))
+batch
+ [1] 1 1 2 2 1 1 2 2 1 1 2 2 1 1 2 2 1 1 2 2 1 1 2 2
+ Levels: 1 2
+
+mm <- model.matrix(~0 + group + batch)
+y <- voom(d, mm, plot = F)
+fit <- lmFit(y, mm)
+
+contr <- makeContrasts(groupI5.6 - groupC.6, levels = colnames(coef(fit)))
+tmp <- contrasts.fit(fit, contr)
+tmp <- eBayes(tmp)
+top.table <- topTable(tmp, sort.by = "P", n = Inf)
+head(top.table, 20)
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
+

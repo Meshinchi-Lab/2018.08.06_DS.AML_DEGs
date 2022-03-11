@@ -1,0 +1,348 @@
+---
+title: 'DS AML Differential Expression'
+author: "Jenny Smith"
+date: "August 7, 2018"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME, '2018.08.06_DS.AML_DEGs/'))
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/DifferentialExpressionPipeline_7.05.18.r")
+```
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/TARGET_AML_1031_CDE_cleaned_7.06.2018.csv")
+
+head(CDE.1031)
+```
+
+```{r}
+CDE.0531 <- read.csv("~/reference_mapping-files/TARGET_AML_current_asof_june30_2016_UPDATED_CLEAN_4.19.18.csv", stringsAsFactors = FALSE)
+
+head(CDE.0531)
+```
+
+```{r}
+DS <- read.csv("~/FH_HighSchool_Internships/2018/AAML0531_DS_AML_list.csv", stringsAsFactors = FALSE)
+
+head(DS)
+```
+
+
+#Read in the expression data
+
+```{r}
+DS.fhcrc <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/level3/gene/concat_matrices/2018Aug_FHCRC_1031_Concatenated_Illumina_data/TARGET_AML_1031_DS.AML_HTSeq_Hg38_Counts.csv", row.names = 1)
+```
+
+```{r}
+#Remove Summary Statistics 
+# DS.fhcrc <- DS.fhcrc[!grepl("^_",rownames(DS.fhcrc)), ]
+
+head(DS.fhcrc)
+```
+
+```{r}
+# cts <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML0531_dupGenesRemoved_FractionalCounts.csv", row.names = 1)
+
+# head(cts[,1:5])
+```
+
+
+#Create a CDE sheet for the samples
+
+```{r}
+CDE.DS <- data.frame(Sample=colnames(DS.fhcrc)) %>%
+            mutate(Reg.=as.numeric(str_split_fixed(Sample, "_", n=3)[,3]),
+                  group=str_split_fixed(Sample, "_",n=3)[,1]) %>%
+            left_join(., select(CDE.1031, USI,Reg.,Age.Yrs,ISCN,Rare.Variants,Prevalent.Variants,
+                                  Prevalent.Mutations,FLT3.ITD.), by="Reg.") %>%
+  # filter(!Sample=="M7_03_817389") %>%
+  # droplevels(.) %>%
+  set_rownames(.$Sample) 
+
+head(CDE.DS[,1:5])
+# write.csv(CDE.DS, "TARGET_AML_1031_M7s_DS-AML_CDE.csv" )
+```
+
+idic(21): an abnormal structure with two centromeres.
+
+```{r}
+M7.CDE <- CDE.0531 %>% 
+  select(USI=TARGET.USI.1, everything()) %>% 
+  filter(grepl("M7",FAB.Category)) %>%
+  select(Reg., USI, Protocol,Age.at.Diagnosis.in.Days, ISCN, Primary.Cytogenetic.Code, FAB.Category, FLT3.ITD.positive., CBFA2T3.GLIS2, NUP98.KDM5A) %>%
+  bind_rows(DS) %>%
+  mutate_at(vars(Abnormality), funs(ifelse(is.na(.), "M7", .))) %>%
+  set_rownames(.$USI)
+
+head(M7.CDE[,1:5])
+# write.csv(M7.CDE, "TARGET_AML_0531_M7s_DS-AML_CDE.csv")
+```
+
+```{r}
+table(M7.CDE$Abnormality)
+```
+
+
+#Box plots of the raw counts
+
+```{r fig.height=4}
+par(cex=0.81)
+graphics::boxplot(log2(DS.fhcrc+1), col=c(rep("red",3),rep("darkgrey",3))) 
+```
+
+See a slight bias where the M7s have higher raw counts. 
+
+#Run DE on 1031 samples
+
+```{r message=FALSE, warning=FALSE}
+# tiff("TARGET_AML_1031_DS.AML_vs_M7s_Heatmap.tiff", height = 10, width = 10, units="in", res=200)
+DS.DE <- twoGroups_DEGs(expnData = DS.fhcrc, 
+                        clinData = CDE.DS,
+                        col = "group",
+                        ref = "M7")
+# dev.off()
+
+```
+
+```{r}
+DS.DE$phenovector
+```
+
+```{r}
+DS.DE$DE$Voom$E <- DS.DE$DE$Voom$E[!grepl("^_",rownames(DS.DE$DE$Voom$E )), ]
+dim(DS.DE$DE$Voom$E) # 13305     expressed genes
+
+write.csv(DS.DE$DE$Voom$E, "TARGET_AML_1031_DS.AML_HTSeq_Hg38_TMMCPM_norm_counts.csv")
+```
+
+
+```{r}
+DS.DE$DE$DE
+```
+
+
+```{r}
+library(gtools)
+all.genes <- data.frame(logFC=DS.DE$DE$eBayesFit$coefficients[,1],
+                     pValue=DS.DE$DE$eBayesFit$p.value[,1],
+                     FDR=p.adjust(DS.DE$DE$eBayesFit$p.value[,1], method="BH"), 
+                     Log2.MeanExpression.inAllSamples=DS.DE$DE$eBayesFit$Amean,
+                     stringsAsFactors = FALSE) %>%
+  rownames_to_column("Gene") %>%
+  mutate(FoldChange=logratio2foldchange(logFC)) %>%
+  select(Gene,Log2.MeanExpression.inAllSamples,logFC, FoldChange, pValue,FDR) %>%
+  filter(!grepl("^_", Gene)) %>%
+  arrange(pValue) 
+
+options(scipen = 999)
+head(all.genes)
+dim(all.genes)
+# write.csv(all.genes, "TARGET_AML_1031_DS.AML_vs_M7s_allGenesTested.csv", row.names = FALSE)
+```
+
+
+```{r}
+sigGenes <-  all.genes %>%
+  filter(pValue < 0.05) 
+# dim(sigGenes)
+# write.csv(sigGenes,"TARGET_AML_1031_DS.AML_vs_M7s_DEGs.csv", row.names = FALSE)
+```
+
+
+
+
+#Examine the output 
+
+
+```{r fig.height=4}
+par(cex=0.81)
+graphics::boxplot(DS.DE$DE$Voom$E, col=c(rep("red",3),rep("darkgrey",3))) 
+```
+
+TMM and CPM normalization worked appropriately. 
+
+Could use the unadjusted p-values just for the sake of investigation.
+
+#PCA
+
+```{r}
+# tiff("TARGET_AML_1031_DS.AML_vs_M7s_PCAplot.tiff", height = 5, width=7, units="in", res=200)
+PCA.plot.ds <- extract_PCA(DS.DE) +
+  scale_color_manual(values=c("GroupA"="red", "GroupB"="black"), labels = c("DS","M7")) + 
+  labs(title="Down Syndrome AML vs Other M7 AMLs") +
+  lims(x=c(-45,80), y=c(-40,50)) +
+  geom_text(data = DS.DE$PCA$pca_data, aes(x=PC1, y=PC2,label=DS.DE$PCA$pca_data$name), 
+            vjust=-0.5, hjust=-0.05, size=4)
+# dev.off(0)
+
+
+PCA.plot.ds
+```
+
+
+
+
+ 
+#MA plots 
+
+```{r}
+DEGs.Expn <- all.genes %>%
+  mutate(Neg.Log10.P= -log10(pValue)) %>%
+  mutate(DEGs.Groups=case_when(
+          FoldChange > 2.0 & pValue < 0.05 ~ "FC Greater than 2",
+          FoldChange < -2.0 & pValue < 0.05 ~ "FC Less than 2",
+          TRUE ~ "Not Significant FC"))
+
+# head(DEGs.Expn)
+# dim(DEGs.Expn)
+```
+
+```{r}
+table(DEGs.Expn$DEGs.Groups)
+```
+
+
+
+```{r}
+ggplot(DEGs.Expn, aes(x=Log2.MeanExpression.inAllSamples , y=logFC, color=DEGs.Groups)) + 
+  geom_point(data = filter(DEGs.Expn, DEGs.Groups == "Not Significant FC"), 
+             mapping = aes(x=Log2.MeanExpression.inAllSamples , y=logFC, color=DEGs.Groups), alpha=1)  +
+  geom_point(data= filter(DEGs.Expn, grepl("2", DEGs.Groups)), 
+             mapping = aes(x=Log2.MeanExpression.inAllSamples , y=logFC, color=DEGs.Groups)) +
+  scale_color_manual(values=c("FC Greater than 2"="red", 
+                              "FC Less than 2"="blue",
+                              "Not Significant FC"="grey")) + 
+  theme_bw()
+ 
+  
+```
+
+
+#Volcano Plots
+
+```{r fig.height=7, fig.width=10}
+# tiff("TARGET_AML_1031_DS.AML_vs_M7_VolcanoPlot.tiff", height = 5, width=8, units = "in", res=200)
+volcanoplot(fit=DS.DE$DE$eBayesFit, coef = 1, highlight = 10, names=rownames(DS.DE$DE$eBayesFit$coefficients), cex=0.35)
+abline(h=-log10(0.05),v=c(-1,1), col=c("red","black","black"), lty=2, lwd=3)
+# dev.off()
+```
+
+
+```{r}
+ggplot(DEGs.Expn, aes(x=logFC, y=Neg.Log10.P, color=DEGs.Groups)) +
+  geom_point(data = filter(DEGs.Expn, DEGs.Groups == "Not Significant FC"), 
+             mapping = aes(x=logFC, y=Neg.Log10.P, color=DEGs.Groups), alpha=1)  +
+  
+  geom_point(data= filter(DEGs.Expn, grepl("2", DEGs.Groups)), 
+             mapping = aes(x=logFC, y=Neg.Log10.P, color=DEGs.Groups)) +
+  
+  geom_vline(xintercept=c(-1,1)) +
+  geom_hline(yintercept = -log10(0.05)) +
+  scale_color_manual(values=c("FC Greater than 2"="red", 
+                              "FC Less than 2"="blue",
+                              "Not Significant FC"="darkgrey"))  +
+  theme_bw()
+```
+
+
+
+
+#Run DE on 0531 samples
+
+```{r}
+# tiff("TARGET_AML_0531_DS.AML_vs_M7s_Heatmap.tiff", height = 10, width = 10, units="in", res=200)
+DS.0531 <- twoGroups_DEGs(expnData = cts,
+                          clinData = M7.CDE, 
+                          col="Abnormality", 
+                          ref="M7")
+# dev.off()
+```
+
+
+```{r}
+table(DS.0531$phenovector)
+```
+
+
+```{r}
+DS.0531$DE$Voom$targets <- DS.0531$DE$Voom$targets  %>%
+  rownames_to_column("USI") %>%
+  inner_join(., M7.CDE, by="USI")
+
+# table(DS.0531$DE$Voom$targets$CBFA2T3.GLIS2) #1 patient
+# table(DS.0531$DE$Voom$targets$NUP98.KDM5A)  #1 patient
+```
+
+```{r}
+DEGs.0531 <- extract_DEGs(DS.0531)
+
+head(DEGs.0531)
+# dim(DEGs.0531) #104 genes.
+write.csv(DEGs.0531, "TARGET_AML_0531_DS.AML_vs_M7s_DEGs.csv", row.names = FALSE)
+```
+
+
+```{r}
+# tiff("TARGET_AML_0531_DS.AML_vs_M7_PCAplot.tiff", height = 5, width = 5.5, units="in", res=200)
+
+PCA.plot <- extract_PCA(DS.0531) + 
+  scale_color_manual(values=c("GroupA"="red", "GroupB"="black"), labels = c("DS","M7")) + 
+  labs(title="AAML0531: \n Down Syndrome AML vs Other M7 AMLs") 
+
+PCA.plot
+
+# dev.off()
+
+```
+
+```{r}
+# tiff("TARGET_AML_0531_DS.AML_vs_M7_MDSplot.tiff", height = 5, width = 5.5, units="in", res=200)
+dat <- DS.0531$MDS$scores %>%
+  as.data.frame() %>%
+  rownames_to_column("USI") %>%
+  inner_join(., dplyr::select(DS.0531$DE$Voom$targets, USI, Abnormality), by="USI")
+
+MDS.plot <- extract_MDS(DS.0531) +
+  geom_point(data=dat, size=3, aes(color=Abnormality)) +
+  scale_color_manual(values=c("DS-AML"="red", "M7"="black"), labels = c("DS","M7")) + 
+  labs(title="AAML0531: \n Down Syndrome AML vs Other M7 AMLs") 
+
+
+MDS.plot
+
+# dev.off()
+```
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
